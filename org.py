@@ -14,6 +14,7 @@ class Org(BaseModel):
     class Meta:
         db_table = "sys_org"  # 数据库表名
         verbose_name = "企业/机构"
+        app_label = "*"
         verbose_name_plural = verbose_name
         ordering = ["-create_time"]  # 按照创建时间倒序排列
 
