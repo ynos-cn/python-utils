@@ -104,7 +104,9 @@ def get_user_organizations(org_id):
     return organizations
 
 
-def getBaseParams(request: HttpRequest, keyword_fields=[], allowed_org_ids=None):
+def getBaseParams(
+    request: HttpRequest, keyword_fields=[], allowed_org_ids=None, no_is_delete=False
+):
     """
     获取基础参数
     """
@@ -135,7 +137,8 @@ def getBaseParams(request: HttpRequest, keyword_fields=[], allowed_org_ids=None)
 
     # id 不等于 "-1"
     # query_data &= ~Q(id="-1")
-    query_data &= ~Q(is_delete="1")
+    if no_is_delete is False:
+        query_data &= ~Q(is_delete="1")
 
     logger.info(f"查询条件 = {query_data}")
     return (query_data, sorter, limit, page)

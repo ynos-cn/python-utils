@@ -1,15 +1,7 @@
 from datetime import datetime, timezone
 from django.db import models
 from rest_framework import serializers
-
-
-def format_datetime(dt, fmt="%Y-%m-%d %H:%M:%S"):
-    """
-    格式化时间
-    """
-    if isinstance(dt, datetime):
-        return dt.strftime(fmt)
-    return dt
+from .utils import format_datetime
 
 
 # 基础字段
