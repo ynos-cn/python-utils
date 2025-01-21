@@ -44,8 +44,8 @@ def decode_token(token):
         return None  # Invalid token
 
 
-def new_call_id():
-    return str(uuid.uuid4()).replace("-", "")
+def new_call_id(replace=""):
+    return str(uuid.uuid4()).replace("-", replace)
 
 
 def get_redis_cli(alias="default", write=True):
