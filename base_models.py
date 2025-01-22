@@ -14,9 +14,7 @@ class BaseModel(models.Model):
     updater = models.CharField(verbose_name="更新人", max_length=128)
     org_id = models.IntegerField(verbose_name="所属机构")
     is_delete = models.IntegerField(
-        verbose_name="是否删除 1.删除 0.未删除",
-        blank=True,
-        null=True,
+        verbose_name="是否删除 1.删除 0.未删除", blank=True, null=True, db_index=True
     )
 
     class Meta:
