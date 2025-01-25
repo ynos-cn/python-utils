@@ -211,7 +211,7 @@ def _fallback_org_query(root_id: int) -> Set[int]:
     return org_set
 
 
-def get_all_parent_orgs(org_id: int) -> List[int]:
+def get_all_parent_orgs(org_id) -> List[int]:
     """
     获取机构及所有父机构ID（优化版）
     优化点：
@@ -220,15 +220,11 @@ def get_all_parent_orgs(org_id: int) -> List[int]:
     3. 防御性编程增强
     4. 数据库兼容性处理
     """
-    # ==================== 参数校验 ====================
-    if not isinstance(org_id, int) or org_id <= 0:
-        raise ValueError("机构ID必须为正整数")
-
     # ==================== 缓存检查 ====================
     redis_key = f"org_parent:{org_id}"
     if cached := get_redis_cli().lrange(redis_key, 0, -1):
         logger.info(f"[缓存命中] 机构{org_id}父机构链")
-        return [int(id_str) for id_str in cached]
+        return [id_str for id_str in cached]
 
     # ==================== 数据库查询 ====================
     org_ids = []
