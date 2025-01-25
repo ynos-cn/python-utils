@@ -1,4 +1,9 @@
+from collections import deque
+import random
+from typing import List, Set
+from django.db import DatabaseError, connection
 from django.http import HttpRequest
+from redis import RedisError
 from .org import Org
 from django.db.models import Q
 from rest_framework.parsers import JSONParser
@@ -24,6 +29,52 @@ def get_sorter(body):
             elif direction == -1:
                 ordering.append(f"-{field}")
     return ordering
+
+
+def get_sorter_sql(body, valid_columns_with_alias={}):
+    """
+    多表查询的动态 ORDER BY 生成器
+    :param body: 请求参数，包含排序字段
+    :param valid_columns_with_alias: 允许排序的字段及表别名映射，格式为 {"字段名": "表别名"}
+                                    例如 {"create_time": "p", "role_name": "rr"}
+    :return: 安全的 SQL ORDER BY 子句
+    """
+    # 默认排序规则（明确指定表别名）
+    ordering = ["-p.create_time"]
+    sorter = body.get("sorter", {})
+
+    for camel_field, direction in sorter.items():
+        # 驼峰转下划线
+        snake_field = camel_to_snake(camel_field)
+
+        # 校验字段合法性
+        if snake_field not in valid_columns_with_alias:
+            continue  # 忽略非法字段
+
+        # 获取字段对应的表别名
+        table_alias = valid_columns_with_alias[snake_field]
+        qualified_field = f"{table_alias}.{snake_field}"
+
+        # 如果操作字段是 create_time，移除默认排序
+        if snake_field == "create_time" and "-p.create_time" in ordering:
+            ordering.remove("-p.create_time")
+
+        # 添加带表别名的排序标记
+        if direction == 1:
+            ordering.append(qualified_field)
+        elif direction == -1:
+            ordering.append(f"-{qualified_field}")
+
+    # 转换为 SQL 语法
+    order_clauses = []
+    for field in ordering:
+        if field.startswith("-"):
+            column = field[1:]
+            order_clauses.append(f"{column} DESC")
+        else:
+            order_clauses.append(f"{field} ASC")
+
+    return f"ORDER BY {', '.join(order_clauses)}" if order_clauses else ""
 
 
 def is_valid_time_range(key, value):
@@ -73,35 +124,178 @@ def delete_user_organizations():
         get_redis_cli().delete(key)
 
 
-# 查询权限
-def get_user_organizations(org_id):
+def get_user_organizations(org_id: int) -> Set[int]:
     """
-    获取用户所在机构及其所有子机构的ID列表
+    获取用户所在机构及其所有子机构的ID集合（SQL优化版）
+    优化点：
+    1. 使用SQL递归查询替代Python递归
+    2. 改进缓存机制
+    3. 防御性编程
+    4. 性能优化
     """
-    organizations = {org_id}
-    redis_list = get_redis_cli().smembers(f"auth_org_ids_:{org_id}")
-    if redis_list:
-        while redis_list:
-            ele = redis_list.pop()
-            str_ele = str(ele, encoding="utf-8")
-            organizations.add(str_ele)
-        return organizations
+    redis_key = f"auth_org_ids:{org_id}"
 
-    logger.info(
-        f"====================== {org_id} 机构没有缓存 需要查询数据库 ==================="
-    )
+    # ========================== 1. 尝试从缓存获取 ==========================
+    if cached := get_redis_cli().smembers(redis_key):
+        logger.info(f"[缓存命中] 机构{org_id}子机构列表")
+        return {int(org_id_str) for org_id_str in cached}
 
-    # 递归函数来查找所有子机构
-    def get_children(org_id):
-        children = Org.objects.filter(org_id=org_id)
-        for child in children:
-            organizations.add(child.id)
-            get_children(child.id)
+    logger.info(f"[缓存未命中] 开始查询机构{org_id}层级数据")
 
-    get_children(org_id)
+    # ========================== 2. 数据库递归查询 ==========================
+    org_set = set()
+    try:
+        with connection.cursor() as cursor:
+            # MySQL 8.0+ 递归查询语法
+            recursive_sql = f"""
+            WITH RECURSIVE org_tree AS (
+                SELECT id, org_id
+                FROM {Org._meta.db_table}
+                WHERE id = %s
+                UNION ALL
+                SELECT o.id, o.org_id
+                FROM {Org._meta.db_table} o
+                INNER JOIN org_tree ot ON o.org_id = ot.id
+            )
+            SELECT id FROM org_tree
+            """
+            cursor.execute(recursive_sql, [org_id])
+            org_set = {row[0] for row in cursor.fetchall()}
 
-    get_redis_cli().sadd(f"auth_org_ids_:{org_id}", *organizations)
-    return organizations
+    except DatabaseError as e:
+        # 数据库不支持递归查询时降级处理
+        if "syntax" in str(e).lower():
+            return _fallback_org_query(org_id)
+        logger.error(f"数据库查询失败: {str(e)}")
+        raise
+
+    # ========================== 3. 缓存处理 ==========================
+    if org_set:
+        # 转换为字符串列表存储
+        org_str_list = [str(org_id) for org_id in org_set]
+        try:
+            # 设置缓存过期时间(1小时)和随机抖动防止雪崩
+            ex_time = 3600 + random.randint(0, 300)
+            get_redis_cli().sadd(redis_key, *org_str_list)
+            get_redis_cli().expire(redis_key, ex_time)
+        except RedisError as e:
+            logger.warning(f"Redis操作失败: {str(e)}")
+
+    return org_set
+
+
+def _fallback_org_query(root_id: int) -> Set[int]:
+    """递归查询降级方案"""
+    org_set = set()
+    queue = deque([root_id])
+    max_depth = 20  # 防止恶意数据导致无限循环
+
+    with connection.cursor() as cursor:
+        for _ in range(max_depth):
+            if not queue:
+                break
+
+            current_id = queue.popleft()
+            if current_id in org_set:
+                continue
+
+            org_set.add(current_id)
+
+            # 查询直接子机构
+            cursor.execute(
+                f"SELECT id FROM {Org._meta.db_table} WHERE org_id = %s", [current_id]
+            )
+            children = [row[0] for row in cursor.fetchall()]
+            queue.extend(children)
+
+    return org_set
+
+
+def get_all_parent_orgs(org_id: int) -> List[int]:
+    """
+    获取机构及所有父机构ID（优化版）
+    优化点：
+    1. 使用递归SQL查询替代循环查询
+    2. 添加缓存机制
+    3. 防御性编程增强
+    4. 数据库兼容性处理
+    """
+    # ==================== 参数校验 ====================
+    if not isinstance(org_id, int) or org_id <= 0:
+        raise ValueError("机构ID必须为正整数")
+
+    # ==================== 缓存检查 ====================
+    redis_key = f"org_parent:{org_id}"
+    if cached := get_redis_cli().lrange(redis_key, 0, -1):
+        logger.info(f"[缓存命中] 机构{org_id}父机构链")
+        return [int(id_str) for id_str in cached]
+
+    # ==================== 数据库查询 ====================
+    org_ids = []
+    try:
+        with connection.cursor() as cursor:
+            # MySQL 8.0+/PostgreSQL 递归查询
+            recursive_sql = f"""
+            WITH RECURSIVE org_chain AS (
+                SELECT id, org_id
+                FROM {Org._meta.db_table}
+                WHERE id = %s AND is_delete IS NULL
+                UNION ALL
+                SELECT so.id, so.org_id
+                FROM {Org._meta.db_table} so
+                INNER JOIN org_chain oc ON so.id = oc.org_id
+                WHERE so.is_delete IS NULL
+            )
+            SELECT id FROM org_chain
+            """
+            cursor.execute(recursive_sql, [org_id])
+            org_ids = [row[0] for row in cursor.fetchall()]
+
+    except DatabaseError as e:
+        if "syntax" in str(e).lower():
+            return _fallback_parent_query(org_id)
+        logger.error(f"递归查询失败: {str(e)}")
+        raise
+
+    # ==================== 缓存处理 ====================
+    if org_ids:
+        try:
+            # 设置缓存带随机过期时间（30分钟±5分钟）
+            ex_time = 1800 + random.randint(-300, 300)
+            get_redis_cli().rpush(redis_key, *map(str, org_ids))
+            get_redis_cli().expire(redis_key, ex_time)
+        except Exception as e:
+            logger.warning(f"缓存写入失败: {str(e)}")
+
+    return org_ids
+
+
+def _fallback_parent_query(org_id: int) -> List[int]:
+    """降级方案：迭代查询"""
+    org_chain = []
+    current_id = org_id
+    max_depth = 20  # 防止死循环
+
+    with connection.cursor() as cursor:
+        for _ in range(max_depth):
+            cursor.execute(
+                f"SELECT org_id FROM {Org._meta.db_table} WHERE id = %s AND is_delete IS NULL",
+                [current_id],
+            )
+            row = cursor.fetchone()
+
+            if not row or row[0] is None:
+                org_chain.append(current_id)
+                break
+
+            if current_id in org_chain:  # 循环检测
+                logger.warning(f"检测到机构循环引用: {org_chain}")
+                break
+
+            org_chain.append(current_id)
+            current_id = row[0]
+
+    return org_chain[::-1]  # 反转保证根节点在前
 
 
 def getBaseParams(
