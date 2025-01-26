@@ -36,5 +36,5 @@ def delete_model_instances(
         length = model_class.objects.using(db).filter(query_data).update(is_delete=1)
     else:
         # 物理删除
-        length = model_class.objects.using(db).filter(query_data).delete()
+        length, _ = model_class.objects.using(db).filter(query_data).delete()
     return length
